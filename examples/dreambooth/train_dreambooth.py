@@ -4,7 +4,7 @@ import itertools
 import math
 import os
 from pathlib import Path
-from typing import Optional
+from typing import Optional, List
 
 import torch
 import torch.nn.functional as F
@@ -53,7 +53,7 @@ def parse_args(input_args=None):
         type=str,
         default=None,
         required=True,
-        help="A folder containing the training data of instance images.",
+        help="Folders containing the training data of instance images. If multiple, separate by comma.",
     )
     parser.add_argument(
         "--class_data_dir",
@@ -67,7 +67,7 @@ def parse_args(input_args=None):
         type=str,
         default=None,
         required=True,
-        help="The prompt with identifier specifying the instance",
+        help="The prompts with identifier specifying the instance. If multiple, separate by comma.",
     )
     parser.add_argument(
         "--class_prompt",
@@ -299,6 +299,89 @@ class DreamBoothDataset(Dataset):
         return example
 
 
+class DreamBoothDatasetMultipleInstancesOneClass(Dataset):
+    """Extends DreamBoothDataset to handle multiple instances and as before only one class."""
+    def __init__(
+            self,
+            instance_data_roots: List[str],
+            instance_prompts: List[str],
+            tokenizer,
+            class_data_root=None,
+            class_prompt=None,
+            size=512,
+            center_crop=False,
+    ):
+        self.size = size
+        self.center_crop = center_crop
+        self.tokenizer = tokenizer
+
+        if len(instance_data_roots) != len(instance_prompts):
+            raise ValueError(f"Need as many images roots (# {len(instance_data_roots)}) "
+                             f"as prompts (# {len(instance_prompts)})")
+        self.instance_images_path = []
+        self.instance_prompts = []
+        for instance_data_root, prompt in zip(instance_data_roots, instance_prompts):
+            instance_data_root = Path(instance_data_root)
+            if not instance_data_root.exists():
+                raise ValueError(f"Instance images root ({instance_data_root}) doesn't exists.")
+            _instance_images_path = list(Path(instance_data_root).iterdir())
+            self.instance_prompts.extend([prompt for _ in range(len(_instance_images_path))])
+            self.instance_images_path.extend(_instance_images_path)
+        self.num_instance_images = len(self.instance_images_path)
+        self._length = self.num_instance_images
+
+        if class_data_root is not None:
+            self.class_data_root = Path(class_data_root)
+            self.class_data_root.mkdir(parents=True, exist_ok=True)
+            self.class_images_path = list(self.class_data_root.iterdir())
+            self.num_class_images = len(self.class_images_path)
+            self._length = max(self.num_class_images, self.num_instance_images)
+            self.class_prompt = class_prompt
+        else:
+            self.class_data_root = None
+
+        self.image_transforms = transforms.Compose(
+            [
+                transforms.Resize(size, interpolation=transforms.InterpolationMode.BILINEAR),
+                transforms.CenterCrop(size) if center_crop else transforms.RandomCrop(size),
+                transforms.ToTensor(),
+                transforms.Normalize([0.5], [0.5]),
+            ]
+        )
+
+    def __len__(self):
+        return self._length
+
+    def __getitem__(self, index):
+        example = {}
+        instance_index = index % self.num_instance_images
+        instance_image = Image.open(self.instance_images_path[instance_index])
+        instance_prompt = self.instance_prompts[instance_index]
+        if not instance_image.mode == "RGB":
+            instance_image = instance_image.convert("RGB")
+        example["instance_images"] = self.image_transforms(instance_image)
+        example["instance_prompt_ids"] = self.tokenizer(
+            instance_prompt,
+            padding="do_not_pad",
+            truncation=True,
+            max_length=self.tokenizer.model_max_length,
+        ).input_ids
+
+        if self.class_data_root:
+            class_image = Image.open(self.class_images_path[index % self.num_class_images])
+            if not class_image.mode == "RGB":
+                class_image = class_image.convert("RGB")
+            example["class_images"] = self.image_transforms(class_image)
+            example["class_prompt_ids"] = self.tokenizer(
+                self.class_prompt,
+                padding="do_not_pad",
+                truncation=True,
+                max_length=self.tokenizer.model_max_length,
+            ).input_ids
+
+        return example
+
+
 class PromptDataset(Dataset):
     "A simple dataset to prepare the prompts to generate class images on multiple GPUs."
 
@@ -327,6 +410,9 @@ def get_full_repo_name(model_id: str, organization: Optional[str] = None, token:
 
 
 def main(args):
+    if args.output_dir is not None:
+        if Path(args.output_dir).exists():
+            raise OSError(f"directory {args.output_dir} already exists")
     logging_dir = Path(args.output_dir, args.logging_dir)
 
     accelerator = Accelerator(
@@ -474,9 +560,9 @@ def main(args):
 
     noise_scheduler = DDPMScheduler.from_config(args.pretrained_model_name_or_path, subfolder="scheduler")
 
-    train_dataset = DreamBoothDataset(
-        instance_data_root=args.instance_data_dir,
-        instance_prompt=args.instance_prompt,
+    train_dataset = DreamBoothDatasetMultipleInstancesOneClass(
+        instance_data_roots=args.instance_data_dir.split(','),
+        instance_prompts=args.instance_prompt.split(','),
         class_data_root=args.class_data_dir if args.with_prior_preservation else None,
         class_prompt=args.class_prompt,
         tokenizer=tokenizer,
