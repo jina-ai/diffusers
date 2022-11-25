@@ -1,6 +1,5 @@
 max_train_steps=200
 
-#output_dir_base="/home/joschka/hf_dreambooth_output/briscoe4-vexx4-lnlw-no_prior-8bit-"$max_train_steps"steps/"
 output_dir_base="/home/joschka/hf_dreambooth_output"
 experiment_name="iteratively"
 trained_model_path="/shared/ml_models/diffuser/stable-diffusion-v1-4/"
